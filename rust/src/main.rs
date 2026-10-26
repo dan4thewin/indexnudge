@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use tree_sitter::{Node, Parser as TsParser, Tree};
+use tree_sitter::{Node, Parser as TsParser};
 use walkdir::WalkDir;
 
 #[derive(Parser)]
@@ -208,8 +208,6 @@ fn index_file(conn: &Connection, parser: &mut TsParser, rel_str: &str, abs_path:
             return index_file_lines_only(conn, rel_str, &source, abs_path);
         }
     };
-
-    let src = source.as_bytes();
 
     // Extract everything in one pass
     let mut extractor = Extractor::new(rel_str.to_string(), &source);
@@ -1994,7 +1992,7 @@ fn main() {
         // body_start should be the first line inside the { block, not the { itself
         // MATCH_SAMPLE line 3 is `Command::Add { name, value } => {`
         // line 4 is `            println!(...)` — that's body_start
-        let (_, _, _, body_start, body_end) = &arms[0];
+        let (_, _, _, body_start, _) = &arms[0];
         // The Add arm body should start at the println line, not the { line
         assert!(*body_start > arms[0].1, "body_start ({}) should be after arm start_line ({})", body_start, arms[0].1);
     }
