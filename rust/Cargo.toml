@@ -1,0 +1,17 @@
+[package]
+name = "indexnudge"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Index Rust source code into SQLite for structural queries"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

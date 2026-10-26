@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Refresh an indexnudge database, then pass the query to the real sqlite3.
+set -euo pipefail
+
+script="${BASH_SOURCE[0]}"
+while [[ -L "$script" ]]; do
+    script_dir="$(cd -P "$(dirname "$script")" && pwd)"
+    script="$(readlink "$script")"
+    [[ "$script" == /* ]] || script="$script_dir/$script"
+done
+script_dir="$(cd -P "$(dirname "$script")" && pwd)"
+
+# Exclude every PATH alias of this wrapper, not directories containing an indexer.
+IFS=: read -ra path_parts <<< "$PATH"
+real_path=()
+for directory in "${path_parts[@]}"; do
+    [[ "${directory:-.}/sqlite3" -ef "$script" ]] || real_path+=("$directory")
+done
+PATH="$(IFS=:; printf '%s' "${real_path[*]}")"
+export PATH
+if ! real_sqlite="$(command -v sqlite3)"; then
+    printf 'indexnudge: sqlite3 is not installed on PATH\n' >&2
+    exit 127
+fi
+
+for arg; do
+    [[ "$arg" == *.indexnudge*.db && -f "$arg" ]] || continue
+    db_dir="$(cd "$(dirname "$arg")" && pwd)"
+    db="$db_dir/$(basename "$arg")"
+    case "$arg" in
+        *.indexnudge-rust.db) language=rust ;;
+        *.indexnudge-go.db) language=go ;;
+        *) language="$("$real_sqlite" "$db" "SELECT DISTINCT language FROM files;")" ;;
+    esac
+    case "$language" in
+        rust|go) ;;
+        *)
+            printf 'indexnudge: cannot determine the indexer for %s\n' "$db" >&2
+            exit 1
+            ;;
+    esac
+
+    indexer="$script_dir/../bin-$language/indexnudge"
+    # Also support a wrapper copied beside its indexer.
+    [[ -x "$indexer" ]] || indexer="$script_dir/indexnudge"
+    if [[ ! -x "$indexer" ]]; then
+        printf 'indexnudge: missing %s indexer; run make %s\n' "$language" "$language" >&2
+        exit 127
+    fi
+    if [[ "$language" == go ]]; then
+        "$indexer" -freshen -dir "$db_dir" -output "$db"
+    else
+        "$indexer" --freshen "$db_dir" --output "$db"
+    fi
+    break
+done
+
+exec "$real_sqlite" -cmd '.timeout 5000' "$@"

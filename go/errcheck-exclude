@@ -1,0 +1,5 @@
+(*database/sql.DB).Close
+(*database/sql.Stmt).Close
+(*database/sql.Rows).Close
+os.Remove
+path/filepath.Walk

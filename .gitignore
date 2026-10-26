@@ -1,0 +1,8 @@
+/rust/target/
+/go/indexnudge
+/bin-rust/indexnudge
+/bin-go/indexnudge
+.indexnudge*.db
+.indexnudge*.db.bak
+.indexnudge*.db.tmp
+__pycache__/

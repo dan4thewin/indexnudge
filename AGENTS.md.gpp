@@ -1,0 +1,517 @@
+<!-- BEGIN indexnudge AGENTS.md block -->
+## Code index database
+
+#ifdef LANG_GO
+This project has an **indexnudge** SQLite database at `.indexnudge-go.db`
+in the repo root containing every line of source, every symbol definition,
+every call site, every import, and full-text search over the code. Go
+channel operations are tracked in a dedicated `channels` table.
+#elif defined(LANG_RUST)
+This project has an **indexnudge** SQLite database at `.indexnudge-rust.db`
+in the repo root containing every line of source, every symbol definition,
+every call site, every import, and full-text search over the code.
+#else
+This project has an **indexnudge** SQLite database (`.indexnudge-rust.db`
+or `.indexnudge-go.db`) at the repo root containing every line of source,
+every symbol definition, every call site, every import, and full-text
+search over the code.
+#endif
+
+Use the index for structural questions: symbol locations, source spans,
+call sites, references, and complexity. Normal source-reading and editing
+tools remain available; no text-tool wrappers are required. The database
+is a snapshot, so refresh it before relying on query results or line numbers.
+
+#ifdef LANG_GO
+Find the database and discover the schema on your first read:
+
+```bash
+DB=.indexnudge-go.db
+sqlite3 "$DB" ".schema"
+```
+#elif defined(LANG_RUST)
+Find the database and discover the schema on your first read:
+
+```bash
+DB=.indexnudge-rust.db
+sqlite3 "$DB" ".schema"
+```
+#else
+Find the database and discover the schema on your first read:
+
+```bash
+DB=$(ls .indexnudge*.db 2>/dev/null | head -1)
+sqlite3 "$DB" ".schema"
+```
+#endif
+
+### Core query patterns
+
+#ifdef LANG_GO
+#define SRC_PATH internal/foo.go
+#define SYM_NAME Server
+#define FN_NAME HandleRequest
+#define CALLEE_NAME RenderTemplate
+#define FILE_EXT go
+#define LANG_VAL go
+#define BIN_DIR bin-go
+#define FRESHEN_FLAG -freshen
+#else
+#define SRC_PATH src/foo.rs
+#define SYM_NAME Parser
+#define FN_NAME handle_request
+#define CALLEE_NAME render_template
+#define FILE_EXT rs
+#define LANG_VAL rust
+#define BIN_DIR bin-rust
+#define FRESHEN_FLAG --freshen
+#endif
+
+```bash
+# Project overview
+sqlite3 "$DB" "SELECT file, lines, language FROM files ORDER BY file;"
+
+# Symbols in a file (functions, methods, types)
+sqlite3 "$DB" "SELECT name, kind, start_line, end_line, signature
+               FROM symbols WHERE file='SRC_PATH' ORDER BY start_line;"
+
+# Find a symbol by name across the whole codebase
+sqlite3 "$DB" "SELECT name, kind, file, start_line, end_line
+               FROM symbols WHERE name LIKE '%SYM_NAME%';"
+
+# Read specific lines (use start_line/end_line from symbols query)
+sqlite3 "$DB" "SELECT line_num, content FROM lines
+               WHERE file='SRC_PATH' AND line_num BETWEEN 120 AND 180;"
+
+# Full-text search (FTS5 — supports phrase, prefix, AND/OR/NOT)
+sqlite3 "$DB" "SELECT file, line_num, content FROM lines_fts
+               WHERE content MATCH '\\"CALLEE_NAME\\"';"
+
+# Call graph: who calls X? what does Y call?
+sqlite3 "$DB" "SELECT caller_file, caller_symbol, line_num
+               FROM calls WHERE callee='CALLEE_NAME';"
+sqlite3 "$DB" "SELECT DISTINCT callee FROM calls
+               WHERE caller_symbol='FN_NAME' ORDER BY callee;"
+
+# Imports — what does this file pull in?
+sqlite3 "$DB" "SELECT module, line_num FROM imports WHERE file='SRC_PATH';"
+```
+
+### Complexity hotspots
+
+Read `symbols.cyclomatic` and `symbols.cognitive` together (NULL for
+non-callables). High cyclomatic with low cognitive often indicates a wide,
+shallow dispatcher, not a reason to refactor. High cognitive points toward
+nesting; high values on both axes warrant a closer look.
+
+```bash
+# Top complexity in the whole codebase
+sqlite3 "$DB" "SELECT name, qualified_name, file, cyclomatic, cognitive,
+                      cognitive - cyclomatic AS delta,
+                      end_line - start_line + 1 AS lines
+               FROM symbols
+               WHERE kind IN ('function','method') AND cyclomatic IS NOT NULL
+               ORDER BY MAX(cyclomatic, cognitive) DESC LIMIT 20;"
+
+# Hotspots in one module
+sqlite3 "$DB" "SELECT name, cyclomatic, cognitive FROM symbols
+               WHERE file LIKE 'src/parse/%' AND kind IN ('function','method')
+               ORDER BY MAX(cyclomatic, cognitive) DESC LIMIT 10;"
+
+# Re-measure the current population rather than hard-coding old averages
+sqlite3 "$DB" "SELECT AVG(cyclomatic) AS mean_cc, AVG(cognitive) AS mean_cog
+               FROM symbols WHERE kind IN ('function','method')
+                 AND cyclomatic IS NOT NULL AND cognitive IS NOT NULL;"
+
+# Distribution — how many functions sit in each bucket?
+sqlite3 "$DB" "SELECT CASE WHEN cyclomatic <= 5  THEN '1-5'
+                           WHEN cyclomatic <= 10 THEN '6-10'
+                           WHEN cyclomatic <= 20 THEN '11-20'
+                           ELSE '21+' END AS bucket,
+                      COUNT(*) AS fns
+               FROM symbols
+               WHERE kind IN ('function','method') AND cyclomatic IS NOT NULL
+               GROUP BY bucket;"
+```
+
+An optional downstream policy is to report both metrics and gate only
+changed functions above a multiple of the current project means. One such
+policy exempts both flat functions (`cognitive <= 2`) and wide dispatchers
+(`cognitive - cyclomatic <= -15`). These are policy choices, not required
+indexnudge thresholds. A hook must use a snapshot matching the staged
+changes and must not treat a query/refresh failure as a passing report.
+
+#ifdef LANG_GO
+Go cyclomatic complexity counts a base per function plus branches, loops,
+switch/select clauses, boolean operators, and nested function-literal
+contributions. Cognitive counts nesting, with one increment for a whole
+switch/select rather than one per clause. The metrics are syntactic
+approximations, not exact substitutes for every other calculator.
+#else
+Rust cyclomatic counting is calibrated against Mozilla
+`rust-code-analysis` per-function `cyclomatic.sum` — see the
+[Mozilla source](https://github.com/mozilla/rust-code-analysis/blob/main/src/metrics/cyclomatic.rs):
+
+  - **+1 base** per function/method
+  - **+1 per** `if` (including `if let`), `while` (including
+    `while let`), `for`, `loop`, `match` arm, `&&`, `||`, Rust `?`
+    operator
+  - **+1 per** closure / nested-fn inside the function's body, AND
+    its inner decisions accumulate too (Mozilla's `.sum` merges
+    child-space CCs into the parent)
+
+**Explicitly NOT counted** (Mozilla doesn't either, and several were
+tested empirically and rejected):
+
+  - `matches!` macro invocations (tree-sitter sees a macro, doesn't
+    expand it)
+  - `let-else` declarations
+  - match-arm guards (`pat if cond => ...`)
+  - `|`-alternated patterns (`A | B | C => ...` is one decision)
+  - The `match` / `switch` keyword itself (the arms are what counts)
+
+For an independent comparison, install `rust-code-analysis-cli --locked`
+with Cargo, run `rust-code-analysis-cli -m -p path -O json`, and read
+`metrics.cyclomatic.sum` and `metrics.cognitive.sum` per function.
+Grammar and counting-convention differences can leave residuals; remeasure
+the current source rather than copying historical per-function deltas.
+#endif
+
+### Disambiguating call targets
+
+`calls.callee` stores the short name as written at the call site
+(`find`, `new`, `parse`). When multiple symbols share that short name,
+use the `callee_candidates` view to enumerate possibilities and narrow
+them with what you know about the context:
+
+```bash
+# All candidate targets for one call site
+sqlite3 "$DB" "SELECT candidate_qname, def_file, def_parent
+               FROM callee_candidates
+               WHERE caller_symbol='FN_NAME' AND callee='CALLEE_NAME';"
+
+# Filter to same-crate / same-directory candidates
+sqlite3 "$DB" "SELECT candidate_qname, def_file FROM callee_candidates
+               WHERE caller_symbol='FN_NAME' AND callee='CALLEE_NAME'
+                 AND def_file LIKE 'src/%';"
+
+# Use a parent type the calling fn's body already mentions
+sqlite3 "$DB" "SELECT cc.candidate_qname, cc.def_parent
+               FROM callee_candidates cc
+               WHERE cc.caller_symbol='FN_NAME' AND cc.callee='CALLEE_NAME'
+                 AND EXISTS (
+                   SELECT 1 FROM lines l
+                   WHERE l.file=cc.caller_file
+                     AND l.symbol=cc.caller_symbol
+                     AND l.content LIKE '%' || cc.def_parent || '%');"
+```
+
+The view retains calls with no known local target as rows with NULL
+candidate fields. Multiple local candidates mean ambiguity; narrow with
+WHERE clauses rather than treating a short-name match as resolution.
+
+#ifdef LANG_GO
+`calls.callee_qname` is populated for Go via `go/types`, so calls into
+`fmt`, `errors`, `io`, etc. carry the canonical package-qualified name
+even though those packages aren't indexed. The view honours this: when
+`callee_qname` is set and matches a local symbol's `qualified_name`,
+only that one row is returned.
+
+#else
+For Rust, `calls.callee` is the **final path segment** as written
+(`foo` for `super::m::foo()`, `new` for `Type::new()`), and
+`calls.callee_qname` holds the **full written path** when the call was
+path-qualified (`super::m::foo`, `crate::util::compute`, `Self::new`) —
+otherwise NULL (bare or method calls). The written path is a module
+path, not a `parent::name`, so it won't always equal a symbol's
+`qualified_name`; the view treats it as best-effort disambiguation and
+still matches on the short name.
+
+`calls.kind` is `function`, `method`, `construct` (a PascalCase callee —
+tuple-struct / tuple-enum-variant construction, which the grammar parses
+as a call), or `macro`. Calls written **inside** a macro body
+(`print!("{}", emit_c(x))`) are captured heuristically (an identifier
+immediately before a token tree), not by macro expansion.
+
+#endif
+
+#ifdef LANG_GO
+### Go channel tracking
+
+```bash
+# Where is each channel variable created, written, read, closed, ranged, or selected?
+sqlite3 "$DB" "SELECT operation, file, line_num, symbol
+               FROM channels WHERE var='workCh' ORDER BY file, line_num;"
+
+# All goroutines that send on a channel
+sqlite3 "$DB" "SELECT DISTINCT symbol, file FROM channels
+               WHERE var='workCh' AND operation='send';"
+```
+
+The `channels` table uses `go/types` for accuracy: a `range` over a slice
+will not appear here — only true channel operations are tracked.
+
+#endif
+### Finding string-keyed dispatch
+
+`string_literals` is a view that peels every double-quoted string off
+each source line and classifies its surrounding context. Use it to find
+sites that compare-against / match-against / format-with a specific
+string — far more precise than `lines_fts MATCH '"value"'` which would
+also hit comments, format args, and arbitrary mentions.
+
+#ifdef LANG_GO
+| context     | matches lines like                            |
+|-------------|-----------------------------------------------|
+| `compare`   | `if name == "x"` / `if name != "x"`           |
+| `match_pat` | `case "x":` / `case "x", "y":`                |
+| `fmt`       | `fmt.Print*("...")`, `log.Print*`, `Errorf`   |
+| `arg`       | everything else (function arguments, struct literals, etc.) |
+#elif defined(LANG_RUST)
+| context     | matches lines like                            |
+|-------------|-----------------------------------------------|
+| `compare`   | `if name == "x"` / `if name != "x"`           |
+| `match_pat` | `"x" => ...` / `"x" \| "y" => ...`            |
+| `fmt`       | `format!`, `println!`, `panic!`, etc.         |
+| `arg`       | everything else (function arguments, struct literals, etc.) |
+#else
+| context     | matches lines like                            |
+|-------------|-----------------------------------------------|
+| `compare`   | `if name == "x"` / `if name != "x"`           |
+| `match_pat` | Rust `"x" => ` / `"x" \| "y" => `, Go `case "x":` |
+| `fmt`       | language-specific print/format helpers        |
+| `arg`       | everything else                               |
+#endif
+
+```bash
+# Every site that dispatches on one of N builtin names
+sqlite3 "$DB" "SELECT file, line_num, symbol, value, context
+               FROM string_literals
+               WHERE value IN ('echo','true','false','printf','exec')
+                 AND context IN ('compare','match_pat')
+               ORDER BY file, line_num;"
+
+# Where is literal 'X' used as a format-string vs a real arg?
+sqlite3 "$DB" "SELECT context, COUNT(*) FROM string_literals
+               WHERE value LIKE '%error%' GROUP BY context;"
+
+# Find string-keyed dispatch outside the canonical from_name() functions
+sqlite3 "$DB" "SELECT file, line_num, symbol, value FROM string_literals
+               WHERE value IN ('echo','true','false')
+                 AND context = 'match_pat'
+                 AND symbol NOT LIKE '%::from_name';"
+```
+
+Limits: lines that begin with `//` are filtered to suppress comment
+false positives; multi-line raw strings (`r#"..."#` in Rust, backtick
+strings in Go) only appear up to the first newline; escaped `\"`
+inside a string can split it early. For the dispatch-discovery use
+case these gaps are rarely material.
+
+### Finding repeated code (extract-helper candidates)
+
+`block_dupes` is a view that surfaces every 4-line block of code that
+appears 2+ times across the codebase. Use it before extracting a helper
+to make sure you find every callsite, not just the obvious ones.
+
+```bash
+# Top duplication hotspots
+sqlite3 "$DB" "SELECT occurrences, substr(replace(shingle, char(10), ' / '), 1, 80) AS preview
+               FROM block_dupes ORDER BY occurrences DESC LIMIT 20;"
+
+# Sites of a specific duplicate (find the locations to refactor)
+sqlite3 "$DB" "SELECT occurrences, sites FROM block_dupes
+               WHERE shingle LIKE '%create_sized_stack_slot%' LIMIT 5;"
+
+# Filter out comma-separated parameter-list noise — focus on real code
+sqlite3 "$DB" "SELECT occurrences, substr(replace(shingle, char(10), ' / '), 1, 100) AS preview
+               FROM block_dupes
+               WHERE shingle NOT LIKE '%,%,%,%,%'
+                 AND length(shingle) > 60
+               ORDER BY occurrences DESC LIMIT 10;"
+```
+
+Limits:
+  - **k=4 fixed.** For a different window size, write your own CTE
+    inline against `lines` with `ROW_NUMBER()` over `(file ORDER BY
+    line_num)`.
+  - **No identifier renaming.** `let ptr = ...` and `let dest = ...`
+    hash differently. In practice the dominant duplicates are
+    literally identical (function signatures, test scaffolding, setup
+    boilerplate), so this matters less than expected.
+  - **Overlapping shingles** within one larger duplicated block all
+    appear separately — merge with your own filter when needed.
+
+#ifndef LANG_GO
+### Finding dead enum variants
+
+`enum_variant_refs` is a view that classifies every `Enum::Variant`
+reference (for locally-defined enums) by syntactic context: `construct`,
+`match_pat`, or `compare`. A variant that is matched/compared but has no
+observed construction is a candidate for investigation; `rustc` may not
+flag it when the enum is publicly reachable.
+
+```bash
+# Candidate variants: referenced but no construction found in the index
+sqlite3 "$DB" "
+  SELECT v.enum, v.variant
+  FROM (SELECT DISTINCT enum, variant FROM enum_variant_refs) v
+  WHERE NOT EXISTS (
+      SELECT 1 FROM enum_variant_refs c
+      WHERE c.enum = v.enum AND c.variant = v.variant
+        AND c.context = 'construct');"
+
+# Every cleanup site for a specific dead variant
+sqlite3 "$DB" "SELECT file, line_num, context FROM enum_variant_refs
+               WHERE enum = 'RedirectOp' AND variant = 'HereDoc'
+               ORDER BY file, line_num;"
+```
+
+`Self::Variant` inside an enum's own `impl` resolves to the enclosing
+type (so those count as construction). Fully-qualified paths
+(`crate::ir::Enum::Variant`) are handled. Limits: bare variants after a
+glob `use Enum::*` import, macro-built variants, and external-crate enums
+are not tracked — this is a high-precision *candidate generator*, so
+confirm before deleting.
+
+**Re-run after each removal.** The detector reports one layer: removing a
+dead variant can make its constructor (and anything reachable only from
+it) newly dead. Re-run the query after each deletion until it returns
+nothing.
+
+### Finding dead structs
+
+`struct_refs` is the struct analog of `enum_variant_refs`: it buckets
+each reference to a locally-defined struct as `construct` (`Name { .. }`,
+`Name(..)`, or `Name::new`/`::from`/any `Name::f(..)`) or `type` (type
+position — field types, signatures, generics). A struct with `type` refs
+but no `construct` is a dead-struct candidate.
+
+```bash
+sqlite3 "$DB" "
+  SELECT s.name FROM (SELECT DISTINCT name FROM struct_refs) s
+  WHERE NOT EXISTS (SELECT 1 FROM struct_refs c
+                    WHERE c.name = s.name AND c.context = 'construct');"
+```
+
+Associated-fn construction (`Interner::new()`) is detected via the
+normalized `calls` data, so structs built only through constructors are
+not false-flagged. Limits: FFI / runtime types allocated via raw
+pointers, and builder/`From`-only construction, may still appear —
+candidate generator, confirm before deleting.
+
+### Finding dead functions
+
+To focus on the public surface that rustc may not flag, filter to symbols
+with written visibility and exclude `construct` "calls". Written
+visibility is not a proof of effective reachability through parent modules:
+
+```bash
+sqlite3 "$DB" "
+  SELECT name, file, start_line FROM symbols
+  WHERE kind = 'function' AND visibility IS NOT NULL
+    AND name NOT IN (SELECT DISTINCT callee FROM calls
+                     WHERE kind IN ('function','method'))
+  ORDER BY file, start_line;"
+```
+
+Known residual false positives include callbacks/function values,
+trait-impl methods invoked through the trait, FFI (`#[no_mangle]` /
+`extern`), entry points, tests, and macro-generated calls. Short-name
+collisions can also hide genuinely unused functions. Re-run after removals;
+do not delete based only on this report.
+
+#endif
+### Schema reference
+
+| Table         | Columns of interest                                                |
+|---------------|--------------------------------------------------------------------|
+| `lines`       | `file, line_num, content, symbol`                                  |
+| `lines_fts`   | FTS5 over `(file, line_num, content, symbol)`                      |
+#ifdef LANG_GO
+| `symbols`     | `name, qualified_name, kind, file, start_line, end_line, parent, signature, cyclomatic, cognitive` |
+#else
+| `symbols`     | `name, qualified_name, kind, file, start_line, end_line, parent, signature, cyclomatic, cognitive, visibility` |
+#endif
+| `calls`       | `caller_file, caller_symbol, callee, callee_qname, kind, line_num`  |
+| `callee_candidates` | view: `calls` ⨝ `symbols` — one row per (call, candidate symbol) |
+| `string_literals` | view: every double-quoted string on every line, with context bucket |
+| `block_dupes` | view: 4-line duplicated runs across the codebase (extract-helper candidates) |
+#ifndef LANG_GO
+| `enum_variant_refs` | view: every `Enum::Variant` ref bucketed `construct`/`match_pat`/`compare` (dead-variant detection) |
+| `struct_refs` | view: every local-struct ref bucketed `construct`/`type` (dead-struct detection) |
+#endif
+| `defs`        | `symbol, file, line_num, var, kind`  *(variable/binding definitions)* |
+| `refs`        | `file, line_num, name, kind` *(identifier references)*             |
+| `blocks`      | `file, open_line, close_line, kind, parent_symbol`                 |
+| `match_arms`  | `file, parent_fn, pattern, start_line, end_line, body_start, body_end, has_early_return` |
+| `imports`     | `file, module, line_num`                                           |
+| `files`       | `file, lines, language, indexed_mtime, indexed_size, parse_error`  |
+| `directories` | `path, file_count, total_lines`                                    |
+#ifdef LANG_GO
+| `channels`    | `file, symbol, line_num, operation, var`                           |
+#endif
+
+#ifndef LANG_GO
+#ifndef LANG_RUST
+Go projects additionally have a `channels` table tracking channel
+operations (`make`, `send`, `recv`, `close`, `range`, `select`).
+#endif
+#endif
+
+### Freshness
+
+#ifdef LANG_GO
+The database is re-freshened on-demand by the `sqlite3` shim in
+`indexnudge/bin-go/`. If that shim is first on `PATH`, every shell
+invocation of `sqlite3` re-parses changed files before querying.
+#elif defined(LANG_RUST)
+The database is re-freshened on-demand by the `sqlite3` shim in
+`indexnudge/bin-rust/`. If that shim is first on `PATH`, every shell
+invocation of `sqlite3` re-parses changed files before querying.
+#else
+The database is re-freshened on-demand by the `sqlite3` shim in
+`indexnudge/bin-rust/` or `indexnudge/bin-go/`. If that shim is first
+on `PATH`, every shell invocation of `sqlite3` re-parses changed files
+before querying.
+#endif
+
+**Non-shim callers bypass this.** Anything that links `libsqlite3`
+directly — Python's `sqlite3` module, Rust `rusqlite`, Node
+`better-sqlite3`, `sqlite-utils`, `litecli`, GUI browsers — opens the
+DB file directly and sees whatever snapshot the last shim invocation
+left behind.
+
+| Caller                                | Triggers shim? |
+|---------------------------------------|----------------|
+#ifdef LANG_GO
+| `bash$ sqlite3 .indexnudge-go.db`     | yes            |
+#elif defined(LANG_RUST)
+| `bash$ sqlite3 .indexnudge-rust.db`   | yes            |
+#else
+| `bash$ sqlite3 .indexnudge*.db`       | yes            |
+#endif
+| `python3 -c "import sqlite3; ..."`    | **no**         |
+| Rust `rusqlite::Connection::open()`   | **no**         |
+| Node `better-sqlite3`                 | **no**         |
+| `sqlite-utils`, `litecli`, GUI tools  | **no**         |
+
+When you drive the index from a script, run `indexnudge FRESHEN_FLAG`
+explicitly first:
+
+```bash
+indexnudge FRESHEN_FLAG     # incremental: only re-parses changed files in cwd
+python3 my_helper.py        # now sees current state
+```
+
+Or wrap the shell call inside the script (`subprocess.run(["sqlite3", ...])`)
+so the shim handles it. Within a single script run, one freshen at the
+top is enough — line numbers stay stable until the script itself mutates
+files.
+
+### Editing
+
+Use the source spans to locate the code, then use the project's normal
+editing tools. Line numbers describe the last indexed snapshot and can
+change after an edit; refresh before relying on them again.
+<!-- END indexnudge AGENTS.md block -->

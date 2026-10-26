@@ -1,0 +1,292 @@
+<!-- BEGIN indexnudge AGENTS.md block -->
+## Code index database
+
+This project has an **indexnudge** SQLite database at `.indexnudge-go.db`
+in the repo root containing every line of source, every symbol definition,
+every call site, every import, and full-text search over the code. Go
+channel operations are tracked in a dedicated `channels` table.
+
+Use the index for structural questions: symbol locations, source spans,
+call sites, references, and complexity. Normal source-reading and editing
+tools remain available; no text-tool wrappers are required. The database
+is a snapshot, so refresh it before relying on query results or line numbers.
+
+Find the database and discover the schema on your first read:
+
+```bash
+DB=.indexnudge-go.db
+sqlite3 "$DB" ".schema"
+```
+
+### Core query patterns
+
+
+```bash
+# Project overview
+sqlite3 "$DB" "SELECT file, lines, language FROM files ORDER BY file;"
+
+# Symbols in a file (functions, methods, types)
+sqlite3 "$DB" "SELECT name, kind, start_line, end_line, signature
+               FROM symbols WHERE file='internal/foo.go' ORDER BY start_line;"
+
+# Find a symbol by name across the whole codebase
+sqlite3 "$DB" "SELECT name, kind, file, start_line, end_line
+               FROM symbols WHERE name LIKE '%Server%';"
+
+# Read specific lines (use start_line/end_line from symbols query)
+sqlite3 "$DB" "SELECT line_num, content FROM lines
+               WHERE file='internal/foo.go' AND line_num BETWEEN 120 AND 180;"
+
+# Full-text search (FTS5 — supports phrase, prefix, AND/OR/NOT)
+sqlite3 "$DB" "SELECT file, line_num, content FROM lines_fts
+               WHERE content MATCH '\"RenderTemplate\"';"
+
+# Call graph: who calls X? what does Y call?
+sqlite3 "$DB" "SELECT caller_file, caller_symbol, line_num
+               FROM calls WHERE callee='RenderTemplate';"
+sqlite3 "$DB" "SELECT DISTINCT callee FROM calls
+               WHERE caller_symbol='HandleRequest' ORDER BY callee;"
+
+# Imports — what does this file pull in?
+sqlite3 "$DB" "SELECT module, line_num FROM imports WHERE file='internal/foo.go';"
+```
+
+### Complexity hotspots
+
+Read `symbols.cyclomatic` and `symbols.cognitive` together (NULL for
+non-callables). High cyclomatic with low cognitive often indicates a wide,
+shallow dispatcher, not a reason to refactor. High cognitive points toward
+nesting; high values on both axes warrant a closer look.
+
+```bash
+# Top complexity in the whole codebase
+sqlite3 "$DB" "SELECT name, qualified_name, file, cyclomatic, cognitive,
+                      cognitive - cyclomatic AS delta,
+                      end_line - start_line + 1 AS lines
+               FROM symbols
+               WHERE kind IN ('function','method') AND cyclomatic IS NOT NULL
+               ORDER BY MAX(cyclomatic, cognitive) DESC LIMIT 20;"
+
+# Hotspots in one module
+sqlite3 "$DB" "SELECT name, cyclomatic, cognitive FROM symbols
+               WHERE file LIKE 'src/parse/%' AND kind IN ('function','method')
+               ORDER BY MAX(cyclomatic, cognitive) DESC LIMIT 10;"
+
+# Re-measure the current population rather than hard-coding old averages
+sqlite3 "$DB" "SELECT AVG(cyclomatic) AS mean_cc, AVG(cognitive) AS mean_cog
+               FROM symbols WHERE kind IN ('function','method')
+                 AND cyclomatic IS NOT NULL AND cognitive IS NOT NULL;"
+
+# Distribution — how many functions sit in each bucket?
+sqlite3 "$DB" "SELECT CASE WHEN cyclomatic <= 5  THEN '1-5'
+                           WHEN cyclomatic <= 10 THEN '6-10'
+                           WHEN cyclomatic <= 20 THEN '11-20'
+                           ELSE '21+' END AS bucket,
+                      COUNT(*) AS fns
+               FROM symbols
+               WHERE kind IN ('function','method') AND cyclomatic IS NOT NULL
+               GROUP BY bucket;"
+```
+
+An optional downstream policy is to report both metrics and gate only
+changed functions above a multiple of the current project means. One such
+policy exempts both flat functions (`cognitive <= 2`) and wide dispatchers
+(`cognitive - cyclomatic <= -15`). These are policy choices, not required
+indexnudge thresholds. A hook must use a snapshot matching the staged
+changes and must not treat a query/refresh failure as a passing report.
+
+Go cyclomatic complexity counts a base per function plus branches, loops,
+switch/select clauses, boolean operators, and nested function-literal
+contributions. Cognitive counts nesting, with one increment for a whole
+switch/select rather than one per clause. The metrics are syntactic
+approximations, not exact substitutes for every other calculator.
+
+### Disambiguating call targets
+
+`calls.callee` stores the short name as written at the call site
+(`find`, `new`, `parse`). When multiple symbols share that short name,
+use the `callee_candidates` view to enumerate possibilities and narrow
+them with what you know about the context:
+
+```bash
+# All candidate targets for one call site
+sqlite3 "$DB" "SELECT candidate_qname, def_file, def_parent
+               FROM callee_candidates
+               WHERE caller_symbol='HandleRequest' AND callee='RenderTemplate';"
+
+# Filter to same-crate / same-directory candidates
+sqlite3 "$DB" "SELECT candidate_qname, def_file FROM callee_candidates
+               WHERE caller_symbol='HandleRequest' AND callee='RenderTemplate'
+                 AND def_file LIKE 'src/%';"
+
+# Use a parent type the calling fn's body already mentions
+sqlite3 "$DB" "SELECT cc.candidate_qname, cc.def_parent
+               FROM callee_candidates cc
+               WHERE cc.caller_symbol='HandleRequest' AND cc.callee='RenderTemplate'
+                 AND EXISTS (
+                   SELECT 1 FROM lines l
+                   WHERE l.file=cc.caller_file
+                     AND l.symbol=cc.caller_symbol
+                     AND l.content LIKE '%' || cc.def_parent || '%');"
+```
+
+The view retains calls with no known local target as rows with NULL
+candidate fields. Multiple local candidates mean ambiguity; narrow with
+WHERE clauses rather than treating a short-name match as resolution.
+
+`calls.callee_qname` is populated for Go via `go/types`, so calls into
+`fmt`, `errors`, `io`, etc. carry the canonical package-qualified name
+even though those packages aren't indexed. The view honours this: when
+`callee_qname` is set and matches a local symbol's `qualified_name`,
+only that one row is returned.
+
+
+### Go channel tracking
+
+```bash
+# Where is each channel variable created, written, read, closed, ranged, or selected?
+sqlite3 "$DB" "SELECT operation, file, line_num, symbol
+               FROM channels WHERE var='workCh' ORDER BY file, line_num;"
+
+# All goroutines that send on a channel
+sqlite3 "$DB" "SELECT DISTINCT symbol, file FROM channels
+               WHERE var='workCh' AND operation='send';"
+```
+
+The `channels` table uses `go/types` for accuracy: a `range` over a slice
+will not appear here — only true channel operations are tracked.
+
+### Finding string-keyed dispatch
+
+`string_literals` is a view that peels every double-quoted string off
+each source line and classifies its surrounding context. Use it to find
+sites that compare-against / match-against / format-with a specific
+string — far more precise than `lines_fts MATCH '"value"'` which would
+also hit comments, format args, and arbitrary mentions.
+
+| context     | matches lines like                            |
+|-------------|-----------------------------------------------|
+| `compare`   | `if name == "x"` / `if name != "x"`           |
+| `match_pat` | `case "x":` / `case "x", "y":`                |
+| `fmt`       | `fmt.Print*("...")`, `log.Print*`, `Errorf`   |
+| `arg`       | everything else (function arguments, struct literals, etc.) |
+
+```bash
+# Every site that dispatches on one of N builtin names
+sqlite3 "$DB" "SELECT file, line_num, symbol, value, context
+               FROM string_literals
+               WHERE value IN ('echo','true','false','printf','exec')
+                 AND context IN ('compare','match_pat')
+               ORDER BY file, line_num;"
+
+# Where is literal 'X' used as a format-string vs a real arg?
+sqlite3 "$DB" "SELECT context, COUNT(*) FROM string_literals
+               WHERE value LIKE '%error%' GROUP BY context;"
+
+# Find string-keyed dispatch outside the canonical from_name() functions
+sqlite3 "$DB" "SELECT file, line_num, symbol, value FROM string_literals
+               WHERE value IN ('echo','true','false')
+                 AND context = 'match_pat'
+                 AND symbol NOT LIKE '%::from_name';"
+```
+
+Limits: lines that begin with `//` are filtered to suppress comment
+false positives; multi-line raw strings (`r#"..."#` in Rust, backtick
+strings in Go) only appear up to the first newline; escaped `"`
+inside a string can split it early. For the dispatch-discovery use
+case these gaps are rarely material.
+
+### Finding repeated code (extract-helper candidates)
+
+`block_dupes` is a view that surfaces every 4-line block of code that
+appears 2+ times across the codebase. Use it before extracting a helper
+to make sure you find every callsite, not just the obvious ones.
+
+```bash
+# Top duplication hotspots
+sqlite3 "$DB" "SELECT occurrences, substr(replace(shingle, char(10), ' / '), 1, 80) AS preview
+               FROM block_dupes ORDER BY occurrences DESC LIMIT 20;"
+
+# Sites of a specific duplicate (find the locations to refactor)
+sqlite3 "$DB" "SELECT occurrences, sites FROM block_dupes
+               WHERE shingle LIKE '%create_sized_stack_slot%' LIMIT 5;"
+
+# Filter out comma-separated parameter-list noise — focus on real code
+sqlite3 "$DB" "SELECT occurrences, substr(replace(shingle, char(10), ' / '), 1, 100) AS preview
+               FROM block_dupes
+               WHERE shingle NOT LIKE '%,%,%,%,%'
+                 AND length(shingle) > 60
+               ORDER BY occurrences DESC LIMIT 10;"
+```
+
+Limits:
+  - **k=4 fixed.** For a different window size, write your own CTE
+    inline against `lines` with `ROW_NUMBER()` over `(file ORDER BY
+    line_num)`.
+  - **No identifier renaming.** `let ptr = ...` and `let dest = ...`
+    hash differently. In practice the dominant duplicates are
+    literally identical (function signatures, test scaffolding, setup
+    boilerplate), so this matters less than expected.
+  - **Overlapping shingles** within one larger duplicated block all
+    appear separately — merge with your own filter when needed.
+
+### Schema reference
+
+| Table         | Columns of interest                                                |
+|---------------|--------------------------------------------------------------------|
+| `lines`       | `file, line_num, content, symbol`                                  |
+| `lines_fts`   | FTS5 over `(file, line_num, content, symbol)`                      |
+| `symbols`     | `name, qualified_name, kind, file, start_line, end_line, parent, signature, cyclomatic, cognitive` |
+| `calls`       | `caller_file, caller_symbol, callee, callee_qname, kind, line_num`  |
+| `callee_candidates` | view: `calls` ⨝ `symbols` — one row per (call, candidate symbol) |
+| `string_literals` | view: every double-quoted string on every line, with context bucket |
+| `block_dupes` | view: 4-line duplicated runs across the codebase (extract-helper candidates) |
+| `defs`        | `symbol, file, line_num, var, kind`  *(variable/binding definitions)* |
+| `refs`        | `file, line_num, name, kind` *(identifier references)*             |
+| `blocks`      | `file, open_line, close_line, kind, parent_symbol`                 |
+| `match_arms`  | `file, parent_fn, pattern, start_line, end_line, body_start, body_end, has_early_return` |
+| `imports`     | `file, module, line_num`                                           |
+| `files`       | `file, lines, language, indexed_mtime, indexed_size, parse_error`  |
+| `directories` | `path, file_count, total_lines`                                    |
+| `channels`    | `file, symbol, line_num, operation, var`                           |
+
+
+### Freshness
+
+The database is re-freshened on-demand by the `sqlite3` shim in
+`indexnudge/bin-go/`. If that shim is first on `PATH`, every shell
+invocation of `sqlite3` re-parses changed files before querying.
+
+**Non-shim callers bypass this.** Anything that links `libsqlite3`
+directly — Python's `sqlite3` module, Rust `rusqlite`, Node
+`better-sqlite3`, `sqlite-utils`, `litecli`, GUI browsers — opens the
+DB file directly and sees whatever snapshot the last shim invocation
+left behind.
+
+| Caller                                | Triggers shim? |
+|---------------------------------------|----------------|
+| `bash$ sqlite3 .indexnudge-go.db`     | yes            |
+| `python3 -c "import sqlite3; ..."`    | **no**         |
+| Rust `rusqlite::Connection::open()`   | **no**         |
+| Node `better-sqlite3`                 | **no**         |
+| `sqlite-utils`, `litecli`, GUI tools  | **no**         |
+
+When you drive the index from a script, run `indexnudge -freshen`
+explicitly first:
+
+```bash
+indexnudge -freshen     # incremental: only re-parses changed files in cwd
+python3 my_helper.py        # now sees current state
+```
+
+Or wrap the shell call inside the script (`subprocess.run(["sqlite3", ...])`)
+so the shim handles it. Within a single script run, one freshen at the
+top is enough — line numbers stay stable until the script itself mutates
+files.
+
+### Editing
+
+Use the source spans to locate the code, then use the project's normal
+editing tools. Line numbers describe the last indexed snapshot and can
+change after an edit; refresh before relying on them again.
+<!-- END indexnudge AGENTS.md block -->
