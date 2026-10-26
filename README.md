@@ -136,7 +136,8 @@ shell syntax. No quality hooks are installed automatically.
 
 Experimental text-tool wrappers, agent nudges, benchmark transcripts,
 and the project's development history are maintained separately in
-**indexnudge-exp**; they are not part of this distribution.
+[`indexnudge-exp`](https://github.com/dan4thewin/indexnudge-exp); they are
+not part of this distribution.
 
 ## License
 
