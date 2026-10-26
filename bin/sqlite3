@@ -25,7 +25,7 @@ fi
 
 for arg; do
     [[ "$arg" == *.indexnudge*.db && -f "$arg" ]] || continue
-    db_dir="$(cd "$(dirname "$arg")" && pwd)"
+    db_dir="$(cd -P "$(dirname "$arg")" && pwd)"
     db="$db_dir/$(basename "$arg")"
     case "$arg" in
         *.indexnudge-rust.db) language=rust ;;
