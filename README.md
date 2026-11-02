@@ -54,8 +54,45 @@ bin-go/indexnudge -freshen -dir /path/to/go-project
 ```
 
 Freshening handles added, changed, and deleted files, checking modification
-time and size. A no-op is silent. A schema version change triggers a full
-rebuild; the database is disposable, not a migration store.
+time and size. A no-op is silent and does not write the database. An older
+schema version triggers a full rebuild; newer, unsupported versions are
+rejected. The database is disposable, not a migration store.
+
+### Refresh consistency
+
+Both indexers acquire an exclusive SQLite lock before inspecting the index
+and scanning for changes. A successful no-change scan simply releases the
+lock. On a change, they commit withdrawal of the public tables and views,
+then refresh and publish them together in a second transaction. The lock
+remains held across both commits. The database stays at its original path;
+there are no application-level file renames or `flock` dependencies.
+
+**Failed refresh work after committed withdrawal leaves no usable public
+index**, rather than serving the old snapshot. Retry `--freshen` after fixing
+the error, or use a full rebuild. Retained `_indexnudge_*` objects are private
+recovery state, not query APIs; do not restore or query them as a stale fallback.
+
+Ordinary SQLite readers participate in these locks. Configure a busy timeout
+to wait instead of failing immediately; the indexers and wrapper use five
+seconds. An active read transaction can delay refresh, but an idle connection
+does not. Timeouts are errors, not permission to serve stale results.
+
+There is a boundary: a lock/setup failure, failed withdrawal commit, or crash
+**during the pre-withdrawal scan** can leave the old public index available.
+Caught scan errors attempt withdrawal before unlocking. The lock does not
+freeze source files, and mtime/size checks cannot detect every possible edit.
+
+Use a filesystem with reliable SQLite locking and rollback-journal `DELETE`
+mode. The indexers use `synchronous=EXTRA` for durable withdrawal/publication.
+Existing WAL databases require quiescent conversion with the real SQLite CLI,
+not the refresh wrapper: `PRAGMA journal_mode=DELETE;`. Stop all old indexers
+before upgrading; mixing legacy rename-based writers with this protocol is
+unsupported. Existing `.bak`/`.tmp` artifacts must be resolved manually first.
+When placing an output database inside the source tree, do not give it the
+indexed language's source extension (`.rs` or `.go`): it must not index itself.
+
+See the [refresh design](docs/transactional-refresh-plan.md) for failure modes,
+concurrency boundaries, and cost tradeoffs.
 
 ## Optional: refresh before every SQLite query
 
@@ -74,7 +111,10 @@ For an existing `.indexnudge-rust.db` or `.indexnudge-go.db`, the wrapper
 runs the corresponding indexer before forwarding arguments to the real
 SQLite CLI. Ordinary SQLite databases pass through. Refresh errors are
 reported rather than querying a known-stale snapshot. Initial indexing is
-explicit; the wrapper does not discover or create new indexes.
+explicit; missing or uninitialized index paths are rejected, not created by
+the query. Keep the index in the project root when using the wrapper.
+SQLite `file:` URI arguments pass through without automatic refresh;
+freshen their filesystem path explicitly first.
 
 Python's `sqlite3`, Rust's `rusqlite`, GUI clients, and other libraries do
 not run this wrapper. Freshen explicitly before opening the database from
@@ -132,7 +172,9 @@ together: a wide dispatcher and deeply nested logic are different shapes.
 ## Development
 
 `make test` runs the existing Rust and Go tests and checks the wrapper's
-shell syntax. No quality hooks are installed automatically.
+shell syntax. `make wrapper-test` builds both CLIs and exercises the wrapper
+with real SQLite queries, failures, and concurrent clients; it also requires
+Python 3 with SQLite support. No quality hooks are installed automatically.
 
 Experimental text-tool wrappers, agent nudges, benchmark transcripts,
 and the project's development history are maintained separately in

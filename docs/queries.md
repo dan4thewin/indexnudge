@@ -13,6 +13,19 @@ Use the refresh wrapper, or run the appropriate indexer's `--freshen`
 (Go: `-freshen -dir PROJECT`) before querying. In-process SQLite clients
 do not trigger the wrapper.
 
+Refresh holds an exclusive SQLite lock, including its no-change scan.
+The wrapper waits up to five seconds per lock wait; other clients should set
+their own busy timeout (for example, `PRAGMA busy_timeout=5000;`).
+After committed withdrawal, a failed refresh leaves public tables/views
+unavailable. Retry refresh after fixing the error, or read the source directly;
+do not substitute the private `_indexnudge_*` recovery objects.
+
+A crash before withdrawal commits can still leave an old snapshot accessible,
+and the database lock does not freeze source files. For multiple queries that
+must use one database generation, use an explicit read transaction; it will
+delay refresh until it ends. See [refresh consistency](../README.md#refresh-consistency)
+for the full contract.
+
 ## Navigate before reading whole files
 
 ```sh

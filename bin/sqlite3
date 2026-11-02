@@ -23,14 +23,71 @@ if ! real_sqlite="$(command -v sqlite3)"; then
     exit 127
 fi
 
+probe=("$real_sqlite" -batch -init /dev/null -cmd '.timeout 5000')
+skip=0
+parse_options=yes
 for arg; do
-    [[ "$arg" == *.indexnudge*.db && -f "$arg" ]] || continue
+    if (( skip > 0 )); then
+        skip=$((skip - 1))
+        continue
+    fi
+    if [[ "$parse_options" == yes ]]; then
+        if [[ "$arg" == -- ]]; then
+            parse_options=no
+            continue
+        fi
+        option="$arg"
+        [[ "$option" != --* ]] || option="${option#-}"
+        case "$option" in
+            -cmd|-cmdline-edit|-escape|-init|-maxsize|-mmap|-newline|-nonce|-nullvalue|-screenwidth|-separator|-vfs)
+                skip=1; continue ;;
+            -lookaside|-pagecache) skip=2; continue ;;
+            -A|-help|-version) break ;;
+            -*) continue ;;
+        esac
+    fi
+    # Only the database argument is eligible, never SQL or option values.
+    [[ "$arg" == file:* ]] && break
+    [[ "$arg" == *.indexnudge*.db ]] || break
+    if [[ ! -f "$arg" ]]; then
+        printf 'indexnudge: index %s does not exist; run the indexer first\n' "$arg" >&2
+        exit 1
+    fi
     db_dir="$(cd -P "$(dirname "$arg")" && pwd)"
     db="$db_dir/$(basename "$arg")"
+    while [[ -L "$db" ]]; do
+        target="$(readlink "$db")"
+        [[ "$target" == /* ]] || target="$db_dir/$target"
+        db_dir="$(cd -P "$(dirname "$target")" && pwd)"
+        db="$db_dir/$(basename "$target")"
+    done
+    # Permit SQLite crash recovery, but never create a database during a probe.
+    db_uri="${db//\%/%25}"
+    db_uri="${db_uri//\?/%3F}"
+    db_uri="file:${db_uri//\#/%23}?mode=rw"
+    if ! layout="$("${probe[@]}" "$db_uri" \
+        "SELECT CASE
+           WHEN EXISTS(SELECT 1 FROM sqlite_schema WHERE name='_indexnudge_state') THEN 'managed'
+           WHEN EXISTS(SELECT 1 FROM sqlite_schema WHERE name='files') THEN 'legacy'
+           ELSE 'uninitialized' END;")"; then
+        printf 'indexnudge: cannot inspect %s\n' "$db" >&2
+        exit 1
+    fi
+    if [[ "$layout" != managed && "$layout" != legacy ]]; then
+        printf 'indexnudge: index %s is not initialized; run the indexer first\n' "$db" >&2
+        exit 1
+    fi
     case "$arg" in
         *.indexnudge-rust.db) language=rust ;;
         *.indexnudge-go.db) language=go ;;
-        *) language="$("$real_sqlite" "$db" "SELECT DISTINCT language FROM files;")" ;;
+        *)
+            if [[ "$layout" == managed ]]; then
+                language_sql="SELECT language FROM _indexnudge_state WHERE id=1;"
+            else
+                language_sql="SELECT DISTINCT language FROM files;"
+            fi
+            language="$("${probe[@]}" "$db_uri" "$language_sql")"
+            ;;
     esac
     case "$language" in
         rust|go) ;;

@@ -476,11 +476,20 @@ on `PATH`, every shell invocation of `sqlite3` re-parses changed files
 before querying.
 #endif
 
-**Non-shim callers bypass this.** Anything that links `libsqlite3`
+**Non-shim callers bypass automatic refresh, not SQLite locking.** Anything that links `libsqlite3`
 directly — Python's `sqlite3` module, Rust `rusqlite`, Node
 `better-sqlite3`, `sqlite-utils`, `litecli`, GUI browsers — opens the
-DB file directly and sees whatever snapshot the last shim invocation
-left behind.
+DB file directly. Refresh explicitly first and configure a busy timeout
+to wait during another refresh (the wrapper uses five seconds).
+
+Refresh acquires an exclusive SQLite lock before checking for changes.
+No changes means no database writes. Otherwise public tables/views are
+withdrawn in a committed transaction before refresh, and published together
+after success; the lock spans both commits. A failure after withdrawal leaves
+the public index unavailable. Fix the error and retry, or use normal source
+tools; private `_indexnudge_*` objects are recovery state, not a stale fallback.
+A failed withdrawal or process death during the pre-withdrawal scan can still
+leave the old public snapshot accessible. Source files are not locked.
 
 | Caller                                | Triggers shim? |
 |---------------------------------------|----------------|
@@ -505,9 +514,10 @@ python3 my_helper.py        # now sees current state
 ```
 
 Or wrap the shell call inside the script (`subprocess.run(["sqlite3", ...])`)
-so the shim handles it. Within a single script run, one freshen at the
-top is enough — line numbers stay stable until the script itself mutates
-files.
+so the shim handles it. While the source tree is unchanged, one freshen at
+the start is sufficient. Use an explicit read transaction when several queries
+must observe one database generation; it delays refresh until the transaction
+ends. Refresh again after source edits, including edits by other processes.
 
 ### Editing
 

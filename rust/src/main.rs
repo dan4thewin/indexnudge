@@ -1,14 +1,16 @@
 // indexnudge — index a Rust codebase into SQLite for agentic querying
 // Uses tree-sitter for parsing. Experiment branch: block spans + references.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rusqlite::Connection;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser as TsParser};
 use walkdir::WalkDir;
+
+mod refresh;
 
 #[derive(Parser)]
 #[command(name = "indexnudge", about = "Index a Rust codebase into SQLite")]
@@ -21,7 +23,7 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Incremental refresh: only re-index files newer than the DB
+    /// Incremental refresh: re-index files whose mtime or size changed
     #[arg(long)]
     freshen: bool,
 }
@@ -41,171 +43,28 @@ fn main() -> Result<()> {
 // ─── Index orchestration ───────────────────────────────────────────────────
 
 fn full_index(dir: &PathBuf, db_path: &PathBuf) -> Result<()> {
-    let bak_path = db_path.with_extension("db.bak");
-    let tmp_path = db_path.with_extension("db.tmp");
-
-    if db_path.exists() {
-        fs::rename(db_path, &bak_path)?;
-    }
-    let _ = fs::remove_file(&tmp_path);
-
-    let result = (|| -> Result<()> {
-        let conn = Connection::open(&tmp_path)?;
-        create_schema(&conn)?;
-
-        let files = collect_rs_files(dir);
-        eprintln!("Indexing {} files...", files.len());
-
-        let mut parser = TsParser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .context("failed to set tree-sitter language")?;
-
-        for file in &files {
-            let rel = file.strip_prefix(dir).unwrap_or(file);
-            let rel_str = rel.to_string_lossy();
-            index_file(&conn, &mut parser, &rel_str, file)?;
-        }
-
-        finalize(&conn)?;
-        Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            fs::rename(&tmp_path, db_path)?;
-            let _ = fs::remove_file(&bak_path);
-            eprintln!("Done. Database: {}", db_path.display());
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Full index failed: {}", e);
-            Err(e)
-        }
-    }
+    refresh::run(dir, db_path, false)
 }
 
 fn freshen(dir: &PathBuf, db_path: &PathBuf) -> Result<()> {
-    let bak_path = db_path.with_extension("db.bak");
-
-    if !db_path.exists() {
-        if bak_path.exists() {
-            eprintln!("Another freshen in progress, skipping.");
-            return Ok(());
-        }
-        eprintln!("No existing database, doing full index.");
-        return full_index(dir, db_path);
-    }
-
-    fs::rename(db_path, &bak_path)?;
-
-    // Check schema version before attempting incremental freshen
-    {
-        let conn = Connection::open(&bak_path)?;
-        if !schema_is_current(&conn) {
-            drop(conn);
-            fs::rename(&bak_path, db_path)?;
-            eprintln!("Schema outdated, doing full reindex.");
-            return full_index(dir, db_path);
-        }
-    }
-
-    let result = (|| -> Result<(u64, u64)> {
-        let conn = Connection::open(&bak_path)?;
-        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF; PRAGMA busy_timeout=5000;")?;
-
-        conn.execute_batch("BEGIN IMMEDIATE;")?;
-
-        let mut parser = TsParser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .context("failed to set tree-sitter language")?;
-
-        let disk_files = collect_rs_files(dir);
-        let disk_set: HashSet<String> = disk_files
-            .iter()
-            .map(|f| f.strip_prefix(dir).unwrap_or(f).to_string_lossy().to_string())
-            .collect();
-
-        let mut stmt = conn.prepare("SELECT file, indexed_mtime, indexed_size FROM files")?;
-        let db_files: Vec<(String, f64, i64)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2).unwrap_or(0))))?
-            .filter_map(|r| r.ok())
-            .collect();
-        let db_set: HashSet<String> = db_files.iter().map(|(f, _, _)| f.clone()).collect();
-
-        let mut reindexed = 0u64;
-        let mut removed = 0u64;
-
-        for (db_file, _, _) in &db_files {
-            if !disk_set.contains(db_file.as_str()) {
-                delete_file_rows(&conn, db_file)?;
-                removed += 1;
-            }
-        }
-
-        let db_mtimes: HashMap<&str, (f64, i64)> = db_files.iter().map(|(f, m, s)| (f.as_str(), (*m, *s))).collect();
-
-        for file in &disk_files {
-            let rel = file.strip_prefix(dir).unwrap_or(file).to_string_lossy().to_string();
-            let disk_mtime = file_mtime(file);
-            let disk_size = file_size(file);
-
-            let needs_index = if let Some(&(db_mtime, db_size)) = db_mtimes.get(rel.as_str()) {
-                disk_mtime > db_mtime || disk_size != db_size
-            } else {
-                true
-            };
-
-            if needs_index {
-                if db_set.contains(&rel) {
-                    delete_file_rows(&conn, &rel)?;
-                }
-                index_file(&conn, &mut parser, &rel, file)?;
-                reindexed += 1;
-            }
-        }
-
-        if reindexed > 0 || removed > 0 {
-            conn.execute("DELETE FROM directories", [])?;
-            populate_directories(&conn)?;
-        }
-
-        conn.execute_batch("COMMIT;")?;
-        Ok((reindexed, removed))
-    })();
-
-    match result {
-        Ok((reindexed, removed)) => {
-            fs::rename(&bak_path, db_path)?;
-            if reindexed > 0 || removed > 0 {
-                eprintln!("Freshened: {} reindexed, {} removed.", reindexed, removed);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Freshen failed: {}. Database preserved as .bak.", e);
-            Err(e)
-        }
-    }
+    refresh::run(dir, db_path, true)
 }
 
 // ─── File indexing ─────────────────────────────────────────────────────────
 
-fn index_file(conn: &Connection, parser: &mut TsParser, rel_str: &str, abs_path: &PathBuf) -> Result<()> {
-    let source = match fs::read_to_string(abs_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("skip {}: {}", rel_str, e);
-            return Ok(());
-        }
-    };
+fn index_file(conn: &Connection, parser: &mut TsParser, rel_str: &str, abs_path: &Path) -> Result<FileStamp> {
+    let stamp = file_stamp(abs_path)?;
+    let source = fs::read_to_string(abs_path)
+        .with_context(|| format!("reading {}", abs_path.display()))?;
+    ensure!(stamp == file_stamp(abs_path)? && source.len() as i64 == stamp.size,
+        "source changed while reading {}", abs_path.display());
 
     let tree = match parser.parse(&source, None) {
         Some(t) => t,
         None => {
             eprintln!("parse error in {}: (indexing lines only)", rel_str);
-            return index_file_lines_only(conn, rel_str, &source, abs_path);
+            index_file_lines_only(conn, rel_str, &source, stamp)?;
+            return Ok(stamp);
         }
     };
 
@@ -226,16 +85,14 @@ fn index_file(conn: &Connection, parser: &mut TsParser, rel_str: &str, abs_path:
     insert_references(conn, &extractor.references)?;
 
     let line_count = source.lines().count() as i64;
-    let mtime = file_mtime(abs_path);
-    let size = file_size(abs_path);
     conn.execute(
         "INSERT INTO files (file, lines, language, indexed_mtime, indexed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![rel_str, line_count, "rust", mtime, size],
+        rusqlite::params![rel_str, line_count, "rust", stamp.mtime, stamp.size],
     )?;
-    Ok(())
+    Ok(stamp)
 }
 
-fn index_file_lines_only(conn: &Connection, rel_str: &str, source: &str, abs_path: &PathBuf) -> Result<()> {
+fn index_file_lines_only(conn: &Connection, rel_str: &str, source: &str, stamp: FileStamp) -> Result<()> {
     let mut stmt = conn.prepare("INSERT INTO lines (file, line_num, content, symbol) VALUES (?1, ?2, ?3, '')")?;
     let mut stmt_fts = conn.prepare("INSERT INTO lines_fts (file, line_num, content, symbol) VALUES (?1, ?2, ?3, '')")?;
     for (i, line) in source.lines().enumerate() {
@@ -244,11 +101,9 @@ fn index_file_lines_only(conn: &Connection, rel_str: &str, source: &str, abs_pat
         stmt_fts.execute(rusqlite::params![rel_str, ln, line])?;
     }
     let line_count = source.lines().count() as i64;
-    let mtime = file_mtime(abs_path);
-    let size = file_size(abs_path);
     conn.execute(
         "INSERT INTO files (file, lines, language, indexed_mtime, indexed_size, parse_error) VALUES (?1, ?2, ?3, ?4, ?5, 1)",
-        rusqlite::params![rel_str, line_count, "rust", mtime, size],
+        rusqlite::params![rel_str, line_count, "rust", stamp.mtime, stamp.size],
     )?;
     Ok(())
 }
@@ -1361,10 +1216,6 @@ impl Clone for SymbolRange {
 fn create_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
-        PRAGMA journal_mode=DELETE;
-        PRAGMA synchronous=OFF;
-        PRAGMA user_version=12;
-
         CREATE TABLE lines (
             file     TEXT,
             line_num INTEGER,
@@ -1673,18 +1524,9 @@ fn create_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Schema version — bump when tables/columns change.
+/// Schema version — bump when stored data or publication semantics change.
 /// freshen checks this and falls back to full_index if outdated.
-const SCHEMA_VERSION: i64 = 12;
-
-/// Returns true if the DB schema is current. If outdated, freshen
-/// should abandon incremental update and do a full rebuild.
-fn schema_is_current(conn: &Connection) -> bool {
-    let version: i64 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap_or(0);
-    version >= SCHEMA_VERSION
-}
+const SCHEMA_VERSION: i64 = 13;
 
 // ─── DB insertion ─────────────────────────────────────────────────────────
 
@@ -1755,15 +1597,30 @@ fn insert_references(conn: &Connection, refs: &[ReferenceRecord]) -> Result<()> 
 
 // ─── Utilities ────────────────────────────────────────────────────────────
 
-fn collect_rs_files(dir: &PathBuf) -> Vec<PathBuf> {
-    WalkDir::new(dir)
+fn visit_rs_files(dir: &Path, mut visit: impl FnMut(&Path) -> Result<bool>) -> Result<bool> {
+    ensure!(fs::metadata(dir)?.is_dir(), "{} is not a directory", dir.display());
+    for entry in WalkDir::new(dir)
         .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
-        .filter(|e| !e.path_is_symlink())
-        .filter(|e| !e.path().components().any(|c| c.as_os_str() == "target"))
-        .map(|e| e.into_path())
-        .collect()
+        .filter_entry(|e| !e.path().components().any(|c| c.as_os_str() == "target"))
+    {
+        let entry = entry.with_context(|| format!("scanning {}", dir.display()))?;
+        if entry.file_type().is_file()
+            && entry.path().extension().is_some_and(|ext| ext == "rs")
+            && visit(entry.path())?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn collect_rs_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    visit_rs_files(dir, |path| {
+        files.push(path.to_path_buf());
+        Ok(false)
+    })?;
+    Ok(files)
 }
 
 fn delete_file_rows(conn: &Connection, file: &str) -> Result<()> {
@@ -1780,15 +1637,19 @@ fn delete_file_rows(conn: &Connection, file: &str) -> Result<()> {
     Ok(())
 }
 
-fn file_mtime(path: &PathBuf) -> f64 {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64())
-        .unwrap_or(0.0)
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FileStamp {
+    mtime: f64,
+    size: i64,
 }
 
-fn file_size(path: &PathBuf) -> i64 {
-    fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0)
+fn file_stamp(path: &Path) -> Result<FileStamp> {
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let mtime = match metadata.modified()?.duration_since(std::time::UNIX_EPOCH) {
+        Ok(time) => time.as_secs_f64(),
+        Err(time) => -time.duration().as_secs_f64(),
+    };
+    Ok(FileStamp { mtime, size: metadata.len().try_into()? })
 }
 
 fn finalize(conn: &Connection) -> Result<()> {
@@ -1800,8 +1661,7 @@ fn populate_directories(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("SELECT file, lines FROM files")?;
     let rows: Vec<(String, i64)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<rusqlite::Result<_>>()?;
 
     let mut dirs: HashMap<String, (i64, i64)> = HashMap::new();
     for (file, lines) in &rows {
@@ -2142,7 +2002,7 @@ mod freshen_size_tests {
         drop(conn);
 
         // Get the file's mtime as a touch-compatible timestamp
-        let original_mtime = file_mtime(&rs_file);
+        let original_mtime = file_stamp(&rs_file).unwrap().mtime;
         let secs = original_mtime as u64;
 
         // Write different (larger) content
@@ -2157,7 +2017,7 @@ mod freshen_size_tests {
             .expect("touch failed");
 
         // Verify mtime looks the same (within 1 second)
-        let new_mtime = file_mtime(&rs_file);
+        let new_mtime = file_stamp(&rs_file).unwrap().mtime;
         assert!((new_mtime - original_mtime).abs() < 1.1, "mtime should be ~unchanged, got {} vs {}", new_mtime, original_mtime);
 
         // Freshen should detect via size difference

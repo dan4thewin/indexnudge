@@ -1,4 +1,4 @@
-.PHONY: all rust go test rust-test go-test snippets clean
+.PHONY: all rust go test rust-test go-test wrapper-test snippets clean
 
 all: rust go
 
@@ -17,6 +17,9 @@ go-test:
 
 test: rust-test go-test
 	bash -n bin/sqlite3
+
+wrapper-test: all
+	python3 tests/test_sqlite_wrapper.py
 
 snippets:
 	gpp AGENTS.md.gpp > AGENTS.md.snippet

@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
-	"io/fs"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -24,7 +23,7 @@ import (
 func main() {
 	dir := flag.String("dir", ".", "directory to index")
 	output := flag.String("output", "", "output database path (default: <dir>/.indexnudge.db)")
-	freshen := flag.Bool("freshen", false, "incremental refresh: only re-index files newer than the DB")
+	freshen := flag.Bool("freshen", false, "incremental refresh: re-index files whose mtime or size changed")
 	flag.Parse()
 
 	absDir, err := filepath.Abs(*dir)
@@ -49,279 +48,32 @@ func main() {
 }
 
 func fullIndex(dir, dbPath string) error {
-	bakPath := dbPath + ".bak"
-	tmpPath := dbPath + ".tmp"
-
-	// Move existing DB to .bak for safety
-	if _, err := os.Stat(dbPath); err == nil {
-		if err := os.Rename(dbPath, bakPath); err != nil {
-			return err
-		}
-	}
-	// Remove any stale .tmp
-	os.Remove(tmpPath)
-
-	db, err := sql.Open("sqlite", tmpPath)
-	if err != nil {
-		return err
-	}
-
-	indexErr := func() error {
-		defer db.Close()
-
-		if err := createSchema(db); err != nil {
-			return err
-		}
-
-		fset, pkgFiles, info, err := loadPackages(dir)
-		if err != nil {
-			return fmt.Errorf("loading packages: %w", err)
-		}
-
-		// Use collectGoFiles as the canonical file list so fullIndex
-		// and doFreshen see the same set of files.
-		diskFiles := collectGoFiles(dir)
-		fmt.Fprintf(os.Stderr, "Indexing %d files...\n", len(diskFiles))
-
-		for _, absPath := range diskFiles {
-			rel, _ := filepath.Rel(dir, absPath)
-			if f, ok := pkgFiles[absPath]; ok {
-				if err := indexFile(db, fset, rel, absPath, f, info); err != nil {
-					fmt.Fprintf(os.Stderr, "skip %s: %v\n", rel, err)
-				}
-			} else {
-				localFset := token.NewFileSet()
-				src, _ := os.ReadFile(absPath)
-				parsed, parseErr := parser.ParseFile(localFset, absPath, src, parser.ParseComments)
-				if parseErr != nil {
-					fmt.Fprintf(os.Stderr, "parse error %s: %v (indexing lines only)\n", rel, parseErr)
-					if err := indexFileLinesOnly(db, rel, absPath); err != nil {
-						fmt.Fprintf(os.Stderr, "skip %s: %v\n", rel, err)
-					}
-				} else {
-					if err := indexFile(db, localFset, rel, absPath, parsed, nil); err != nil {
-						fmt.Fprintf(os.Stderr, "skip %s: %v\n", rel, err)
-					}
-				}
-			}
-		}
-
-		return finalize(db)
-	}()
-
-	if indexErr != nil {
-		fmt.Fprintf(os.Stderr, "Full index failed: %v. Old database preserved as .bak if it existed.\n", indexErr)
-		return indexErr
-	}
-
-	if err := os.Rename(tmpPath, dbPath); err != nil {
-		return err
-	}
-	os.Remove(bakPath)
-	fmt.Fprintf(os.Stderr, "Done. Database: %s\n", dbPath)
-	return nil
+	return runIndex(dir, dbPath, false)
 }
 
 func doFreshen(dir, dbPath string) error {
-	bakPath := dbPath + ".bak"
-
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		if _, err := os.Stat(bakPath); err == nil {
-			// Another freshen is in progress — exit, let shim fall back
-			fmt.Fprintln(os.Stderr, "Another freshen in progress, skipping.")
-			return nil
-		}
-		fmt.Fprintln(os.Stderr, "No existing database, doing full index.")
-		return fullIndex(dir, dbPath)
-	}
-
-	// Rename canonical → .bak
-	if err := os.Rename(dbPath, bakPath); err != nil {
-		return err
-	}
-
-	// Check schema version before attempting incremental freshen.
-	{
-		probe, err := sql.Open("sqlite", bakPath)
-		if err != nil {
-			return err
-		}
-		current := schemaIsCurrent(probe)
-		probe.Close()
-		if !current {
-			if err := os.Rename(bakPath, dbPath); err != nil {
-				return err
-			}
-			fmt.Fprintln(os.Stderr, "Schema outdated, doing full reindex.")
-			return fullIndex(dir, dbPath)
-		}
-	}
-
-	freshenErr := func() error {
-		db, err := sql.Open("sqlite", bakPath)
-		if err != nil {
-			return err
-		}
-		defer db.Close()
-
-		if _, err := db.Exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF; PRAGMA busy_timeout=5000"); err != nil {
-			return err
-		}
-		if _, err := db.Exec("BEGIN IMMEDIATE"); err != nil {
-			return err
-		}
-
-		diskFiles := collectGoFiles(dir)
-		diskSet := make(map[string]bool)
-		for _, f := range diskFiles {
-			rel, _ := filepath.Rel(dir, f)
-			diskSet[rel] = true
-		}
-
-		rows, err := db.Query("SELECT file, indexed_mtime, indexed_size FROM files")
-		if err != nil {
-			return err
-		}
-		type dbFile struct {
-			file  string
-			mtime float64
-			size  int64
-		}
-		var dbFiles []dbFile
-		for rows.Next() {
-			var f dbFile
-			if err := rows.Scan(&f.file, &f.mtime, &f.size); err != nil {
-				return err
-			}
-			dbFiles = append(dbFiles, f)
-		}
-		rows.Close()
-
-		dbMtimes := make(map[string]float64)
-		dbSizes := make(map[string]int64)
-		for _, f := range dbFiles {
-			dbMtimes[f.file] = f.mtime
-			dbSizes[f.file] = f.size
-		}
-
-		// Check if anything needs updating
-		needsWork := false
-		for _, f := range dbFiles {
-			if !diskSet[f.file] {
-				needsWork = true
-				break
-			}
-		}
-		if !needsWork {
-			for _, absPath := range diskFiles {
-				rel, _ := filepath.Rel(dir, absPath)
-				diskMtime := fileMtime(absPath)
-				diskSize := fileSize(absPath)
-				dbMtime, exists := dbMtimes[rel]
-				if !exists || diskMtime > dbMtime || diskSize != dbSizes[rel] {
-					needsWork = true
-					break
-				}
-			}
-		}
-
-		if !needsWork {
-			if _, err := db.Exec("COMMIT"); err != nil {
-				return err
-			}
-			return nil
-		}
-
-		// Load type info for accurate channel detection
-		fset, pkgFiles, info, err := loadPackages(dir)
-		if err != nil {
-			return fmt.Errorf("loading packages: %w", err)
-		}
-
-		var reindexed, removed int
-
-		// Remove deleted files
-		for _, f := range dbFiles {
-			if !diskSet[f.file] {
-				if err := deleteFileRows(db, f.file); err != nil {
-					return err
-				}
-				removed++
-			}
-		}
-
-		// Index new or stale files
-		for _, absPath := range diskFiles {
-			rel, _ := filepath.Rel(dir, absPath)
-			diskMtime := fileMtime(absPath)
-			diskSize := fileSize(absPath)
-			dbMtime, exists := dbMtimes[rel]
-			if !exists || diskMtime > dbMtime || diskSize != dbSizes[rel] {
-				if exists {
-					if err := deleteFileRows(db, rel); err != nil {
-						return err
-					}
-				}
-				if astFile, ok := pkgFiles[absPath]; ok {
-					if err := indexFile(db, fset, rel, absPath, astFile, info); err != nil {
-						fmt.Fprintf(os.Stderr, "skip %s: %v\n", rel, err)
-						continue
-					}
-				} else {
-					localFset := token.NewFileSet()
-					src, _ := os.ReadFile(absPath)
-					parsed, parseErr := parser.ParseFile(localFset, absPath, src, parser.ParseComments)
-					if parseErr != nil {
-						fmt.Fprintf(os.Stderr, "parse error %s: %v (indexing lines only)\n", rel, parseErr)
-						if err := indexFileLinesOnly(db, rel, absPath); err != nil {
-							fmt.Fprintf(os.Stderr, "skip %s: %v\n", rel, err)
-							continue
-						}
-					} else {
-						if err := indexFile(db, localFset, rel, absPath, parsed, nil); err != nil {
-							fmt.Fprintf(os.Stderr, "skip %s: %v\n", rel, err)
-							continue
-						}
-					}
-				}
-				reindexed++
-			}
-		}
-
-		if reindexed > 0 || removed > 0 {
-			if _, err := db.Exec("DELETE FROM directories"); err != nil {
-				return err
-			}
-			if err := finalize(db); err != nil {
-				return err
-			}
-			fmt.Fprintf(os.Stderr, "Freshened: %d reindexed, %d removed.\n", reindexed, removed)
-		}
-
-		if _, err := db.Exec("COMMIT"); err != nil {
-			return err
-		}
-		return nil
-	}()
-
-	if freshenErr != nil {
-		// db.Close() via defer triggers ROLLBACK. .bak is untouched (pre-freshen state).
-		// Canonical absent — shims fall back to filesystem.
-		fmt.Fprintf(os.Stderr, "Freshen failed: %v. Database preserved as .bak.\n", freshenErr)
-		return freshenErr
-	}
-
-	// Success — rename .bak back to canonical
-	return os.Rename(bakPath, dbPath)
+	return runIndex(dir, dbPath, true)
 }
 
 // loadPackages uses go/packages to get type information for the whole module.
 // Returns the shared FileSet, a map of abs path → parsed AST, and type info.
-func loadPackages(dir string) (*token.FileSet, map[string]*ast.File, *types.Info, error) {
+func loadPackages(dir string, sources map[string]sourceFile) (*token.FileSet, map[string]*ast.File, *types.Info, error) {
+	overlay := make(map[string][]byte, len(sources))
+	for path, source := range sources {
+		overlay[path] = source.data
+	}
 	cfg := &packages.Config{
 		Mode: packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes |
 			packages.NeedTypesInfo | packages.NeedName,
-		Dir: dir,
+		Dir:     dir,
+		Overlay: overlay,
+		ParseFile: func(fset *token.FileSet, filename string, src []byte) (*ast.File, error) {
+			file, err := parser.ParseFile(fset, filename, src, parser.ParseComments)
+			if err != nil {
+				return nil, err
+			}
+			return file, nil
+		},
 	}
 	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
@@ -339,24 +91,29 @@ func loadPackages(dir string) (*token.FileSet, map[string]*ast.File, *types.Info
 	var fset *token.FileSet
 
 	for _, pkg := range pkgs {
+		for _, err := range pkg.Errors {
+			fmt.Fprintf(os.Stderr, "package %s: %v (using available syntax/type info)\n", pkg.PkgPath, err)
+		}
 		if fset == nil {
 			fset = pkg.Fset
 		}
-		for k, v := range pkg.TypesInfo.Types {
-			info.Types[k] = v
+		if pkg.TypesInfo != nil {
+			for k, v := range pkg.TypesInfo.Types {
+				info.Types[k] = v
+			}
+			for k, v := range pkg.TypesInfo.Defs {
+				info.Defs[k] = v
+			}
+			for k, v := range pkg.TypesInfo.Uses {
+				info.Uses[k] = v
+			}
+			for k, v := range pkg.TypesInfo.Selections {
+				info.Selections[k] = v
+			}
 		}
-		for k, v := range pkg.TypesInfo.Defs {
-			info.Defs[k] = v
-		}
-		for k, v := range pkg.TypesInfo.Uses {
-			info.Uses[k] = v
-		}
-		for k, v := range pkg.TypesInfo.Selections {
-			info.Selections[k] = v
-		}
-		for i, f := range pkg.Syntax {
-			if i < len(pkg.GoFiles) {
-				result[pkg.GoFiles[i]] = f
+		for _, f := range pkg.Syntax {
+			if file := pkg.Fset.File(f.Pos()); file != nil {
+				result[file.Name()] = f
 			}
 		}
 	}
@@ -366,67 +123,26 @@ func loadPackages(dir string) (*token.FileSet, map[string]*ast.File, *types.Info
 	return fset, result, info, nil
 }
 
-func collectGoFiles(dir string) []string {
-	var files []string
-	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if d.IsDir() {
-			base := filepath.Base(path)
-			if base == "vendor" || base == ".git" || base == "node_modules" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go") {
-			files = append(files, path)
-		}
-		return nil
-	})
-	return files
-}
-
-func fileMtime(path string) float64 {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0
-	}
-	return float64(info.ModTime().UnixMilli()) / 1000.0
-}
-
-func fileSize(path string) int64 {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0
-	}
-	return info.Size()
-}
-
 // SchemaVersion tracks the on-disk schema layout. Bump whenever tables,
 // columns, indexes, or view definitions change so that --freshen can
 // detect outdated DBs and fall back to a full reindex.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // schemaIsCurrent returns true if the DB schema matches the indexer.
 // freshen consults this and falls back to fullIndex if outdated.
-func schemaIsCurrent(db *sql.DB) bool {
+func schemaIsCurrent(db database) (bool, error) {
 	var version int64
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
-		return false
+		return false, err
 	}
-	return version >= SchemaVersion
+	if version < 0 || version > SchemaVersion {
+		return false, fmt.Errorf("unsupported schema version %d (maximum %d)", version, SchemaVersion)
+	}
+	return version == SchemaVersion, nil
 }
 
-func createSchema(db *sql.DB) error {
+func createSchema(db database) error {
 	schema := `
-PRAGMA journal_mode=DELETE;
-PRAGMA synchronous=OFF;
-PRAGMA user_version=1;
-
 CREATE TABLE lines (
     file     TEXT,
     line_num INTEGER,
@@ -619,15 +335,14 @@ GROUP BY shingle
 HAVING COUNT(*) >= 2;
 `
 	_, err := db.Exec(schema)
+	if err == nil {
+		_, err = db.Exec(fmt.Sprintf("PRAGMA user_version=%d", SchemaVersion))
+	}
 	return err
 }
 
-func indexFile(db *sql.DB, fset *token.FileSet, rel, absPath string, f *ast.File, info *types.Info) error {
-	src, err := os.ReadFile(absPath)
-	if err != nil {
-		return err
-	}
-
+func indexFile(db database, fset *token.FileSet, rel string, source sourceFile, f *ast.File, info *types.Info) error {
+	src := source.data
 	content := strings.TrimSuffix(string(src), "\n")
 	lines := strings.Split(content, "\n")
 	if err := indexLines(db, fset, rel, lines, f); err != nil {
@@ -658,22 +373,16 @@ func indexFile(db *sql.DB, fset *token.FileSet, rel, absPath string, f *ast.File
 		return err
 	}
 
-	mtime := fileMtime(absPath)
-	size := fileSize(absPath)
 	if _, err := db.Exec("INSERT INTO files (file, lines, language, indexed_mtime, indexed_size) VALUES (?, ?, 'go', ?, ?)",
-		rel, len(lines), mtime, size); err != nil {
+		rel, len(lines), source.stamp.mtime, source.stamp.size); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func indexFileLinesOnly(db *sql.DB, rel, absPath string) error {
-	src, err := os.ReadFile(absPath)
-	if err != nil {
-		return err
-	}
-
+func indexFileLinesOnly(db database, rel string, source sourceFile) error {
+	src := source.data
 	content := strings.TrimSuffix(string(src), "\n")
 	lines := strings.Split(content, "\n")
 
@@ -698,16 +407,14 @@ func indexFileLinesOnly(db *sql.DB, rel, absPath string) error {
 		}
 	}
 
-	mtime := fileMtime(absPath)
-	size := fileSize(absPath)
 	if _, err := db.Exec("INSERT INTO files (file, lines, language, indexed_mtime, indexed_size, parse_error) VALUES (?, ?, 'go', ?, ?, 1)",
-		rel, len(lines), mtime, size); err != nil {
+		rel, len(lines), source.stamp.mtime, source.stamp.size); err != nil {
 		return err
 	}
 
 	return nil
 }
-func indexLines(db *sql.DB, fset *token.FileSet, rel string, lines []string, f *ast.File) error {
+func indexLines(db database, fset *token.FileSet, rel string, lines []string, f *ast.File) error {
 	// Build line→symbol map
 	symMap := make(map[int]string)
 	ast.Inspect(f, func(n ast.Node) bool {
@@ -751,7 +458,7 @@ func indexLines(db *sql.DB, fset *token.FileSet, rel string, lines []string, f *
 	return nil
 }
 
-func extractSymbols(db *sql.DB, fset *token.FileSet, rel string, f *ast.File, info *types.Info) error {
+func extractSymbols(db database, fset *token.FileSet, rel string, f *ast.File, info *types.Info) error {
 	stmt, err := db.Prepare(
 		"INSERT INTO symbols (name, qualified_name, kind, file, start_line, end_line, parent, signature, cyclomatic, cognitive) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
@@ -837,11 +544,11 @@ func extractSymbols(db *sql.DB, fset *token.FileSet, rel string, f *ast.File, in
 // cyclomatic.sum, including nested function-literal CCs as if merged into
 // the parent space). Rules:
 //
-//   +1 base per function/method
-//   +1 per IfStmt, ForStmt, RangeStmt, CaseClause (switch), CommClause (select)
-//   +1 per && / ||
-//   +1 per FuncLit (closure) — and recurse INTO the FuncLit body so its
-//     own decisions accumulate, matching how Mozilla merges child-space sums.
+//	+1 base per function/method
+//	+1 per IfStmt, ForStmt, RangeStmt, CaseClause (switch), CommClause (select)
+//	+1 per && / ||
+//	+1 per FuncLit (closure) — and recurse INTO the FuncLit body so its
+//	  own decisions accumulate, matching how Mozilla merges child-space sums.
 //
 // Not counted: TypeSwitchStmt itself (each case clause already counted),
 // matches!-style macros (Go has none), or-pattern equivalents (case lists
@@ -854,8 +561,8 @@ func cyclomaticComplexity(body *ast.BlockStmt) *int {
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.FuncLit:
-			count++       // closure contributes its base +1 to enclosing fn
-			return true   // recurse — closure decisions also count (Mozilla .sum semantics)
+			count++     // closure contributes its base +1 to enclosing fn
+			return true // recurse — closure decisions also count (Mozilla .sum semantics)
 		case *ast.IfStmt:
 			count++
 		case *ast.CaseClause:
@@ -899,18 +606,18 @@ type cogState struct {
 // count_cognitive_complexity (which in turn matches Mozilla
 // rust-code-analysis's `cognitive.sum`). Cross-language node mapping:
 //
-//   *ast.IfStmt              +1 + nesting; else-if and else add +1 flat
-//   *ast.ForStmt             +1 + nesting
-//   *ast.RangeStmt           +1 + nesting
-//   *ast.SwitchStmt          +1 + nesting (the switch itself; arms add 0)
-//   *ast.TypeSwitchStmt      +1 + nesting
-//   *ast.SelectStmt          +1 + nesting
-//   *ast.CaseClause          0
-//   *ast.CommClause          0
-//   *ast.BranchStmt (labeled break/continue/goto)  +1
-//   *ast.BinaryExpr (&&/||)  BoolSequence: +1 first, +1 on operator switch
-//   *ast.UnaryExpr  (!)      sets BoolSequence marker to NOT
-//   *ast.FuncLit             lambda++ inside; closure decisions add to enclosing fn
+//	*ast.IfStmt              +1 + nesting; else-if and else add +1 flat
+//	*ast.ForStmt             +1 + nesting
+//	*ast.RangeStmt           +1 + nesting
+//	*ast.SwitchStmt          +1 + nesting (the switch itself; arms add 0)
+//	*ast.TypeSwitchStmt      +1 + nesting
+//	*ast.SelectStmt          +1 + nesting
+//	*ast.CaseClause          0
+//	*ast.CommClause          0
+//	*ast.BranchStmt (labeled break/continue/goto)  +1
+//	*ast.BinaryExpr (&&/||)  BoolSequence: +1 first, +1 on operator switch
+//	*ast.UnaryExpr  (!)      sets BoolSequence marker to NOT
+//	*ast.FuncLit             lambda++ inside; closure decisions add to enclosing fn
 //
 // Not counted (matching Sonar/Mozilla): early `return`, `defer`, `go`,
 // `?`-style error propagation (Go has none), case-list alternatives
@@ -1047,7 +754,7 @@ func (w *cogChildWalker) Visit(n ast.Node) ast.Visitor {
 	return nil
 }
 
-func extractCalls(db *sql.DB, fset *token.FileSet, rel string, f *ast.File, info *types.Info) error {
+func extractCalls(db database, fset *token.FileSet, rel string, f *ast.File, info *types.Info) error {
 	stmt, err := db.Prepare(
 		"INSERT INTO calls (caller_file, caller_symbol, callee, callee_qname, kind, line_num) VALUES (?, ?, ?, ?, ?, ?)")
 	if err != nil {
@@ -1071,7 +778,7 @@ func extractCalls(db *sql.DB, fset *token.FileSet, rel string, f *ast.File, info
 			case *ast.CallExpr:
 				line := fset.Position(expr.Pos()).Line
 				switch fun := expr.Fun.(type) {
-			case *ast.Ident:
+				case *ast.Ident:
 					qname := ""
 					if info != nil {
 						if obj, ok := info.Uses[fun]; ok && obj != nil {
@@ -1083,7 +790,7 @@ func extractCalls(db *sql.DB, fset *token.FileSet, rel string, f *ast.File, info
 						}
 					}
 					_, execErr = stmt.Exec(rel, callerSym, fun.Name, qname, "function", line)
-			case *ast.SelectorExpr:
+				case *ast.SelectorExpr:
 					callee := selectorString(fun)
 					qname := ""
 					if info != nil {
@@ -1108,7 +815,7 @@ func extractCalls(db *sql.DB, fset *token.FileSet, rel string, f *ast.File, info
 	return nil
 }
 
-func extractImports(db *sql.DB, fset *token.FileSet, rel string, f *ast.File) error {
+func extractImports(db database, fset *token.FileSet, rel string, f *ast.File) error {
 	stmt, err := db.Prepare("INSERT INTO imports (file, module, line_num) VALUES (?, ?, ?)")
 	if err != nil {
 		return err
@@ -1123,7 +830,7 @@ func extractImports(db *sql.DB, fset *token.FileSet, rel string, f *ast.File) er
 	return nil
 }
 
-func extractDefs(db *sql.DB, fset *token.FileSet, rel string, f *ast.File) error {
+func extractDefs(db database, fset *token.FileSet, rel string, f *ast.File) error {
 	stmt, err := db.Prepare(
 		"INSERT INTO defs (symbol, file, line_num, var, kind) VALUES (?, ?, ?, ?, ?)")
 	if err != nil {
@@ -1153,6 +860,9 @@ func extractDefs(db *sql.DB, fset *token.FileSet, rel string, f *ast.File) error
 					if ident, ok := lhs.(*ast.Ident); ok {
 						line := fset.Position(ident.Pos()).Line
 						_, execErr = stmt.Exec(callerSym, rel, line, ident.Name, kind)
+						if execErr != nil {
+							return false
+						}
 					}
 				}
 			case *ast.RangeStmt:
@@ -1160,6 +870,9 @@ func extractDefs(db *sql.DB, fset *token.FileSet, rel string, f *ast.File) error
 					if ident, ok := node.Key.(*ast.Ident); ok {
 						line := fset.Position(ident.Pos()).Line
 						_, execErr = stmt.Exec(callerSym, rel, line, ident.Name, "range_key")
+						if execErr != nil {
+							return false
+						}
 					}
 				}
 				if node.Value != nil {
@@ -1202,7 +915,7 @@ func extractDefs(db *sql.DB, fset *token.FileSet, rel string, f *ast.File) error
 	return nil
 }
 
-func extractChannels(db *sql.DB, fset *token.FileSet, rel string, f *ast.File, info *types.Info) error {
+func extractChannels(db database, fset *token.FileSet, rel string, f *ast.File, info *types.Info) error {
 	stmt, err := db.Prepare(
 		"INSERT INTO channels (file, symbol, line_num, operation, var) VALUES (?, ?, ?, ?, ?)")
 	if err != nil {
@@ -1282,7 +995,7 @@ func extractChannels(db *sql.DB, fset *token.FileSet, rel string, f *ast.File, i
 // Kind is derived from the block's syntactic parent (fn body, if-body,
 // else-body, for-body, switch-body, select-body, closure-body, or bare block).
 // parent_symbol is the qualified name of the enclosing top-level FuncDecl.
-func extractBlocks(db *sql.DB, fset *token.FileSet, rel string, f *ast.File) error {
+func extractBlocks(db database, fset *token.FileSet, rel string, f *ast.File) error {
 	stmt, err := db.Prepare(
 		"INSERT INTO blocks (file, open_line, close_line, kind, parent_symbol) VALUES (?, ?, ?, ?, ?)")
 	if err != nil {
@@ -1374,7 +1087,7 @@ func blockKindFromParent(parent ast.Node, block *ast.BlockStmt) string {
 // extractRefs records every identifier reference with a kind classification
 // (use/def/type/call/field) derived from the syntactic parent. Mirrors the
 // Rust indexer's refs table for cross-language query parity.
-func extractRefs(db *sql.DB, fset *token.FileSet, rel string, f *ast.File) error {
+func extractRefs(db database, fset *token.FileSet, rel string, f *ast.File) error {
 	stmt, err := db.Prepare(
 		"INSERT INTO refs (file, line_num, name, kind) VALUES (?, ?, ?, ?)")
 	if err != nil {
@@ -1496,7 +1209,7 @@ func refKindFromParent(id *ast.Ident, parent ast.Node) string {
 //
 // has_early_return is true when the case body contains a top-level
 // *ast.ReturnStmt (not inside a closure), matching the Rust semantics.
-func extractMatchArms(db *sql.DB, fset *token.FileSet, rel string, src []byte, f *ast.File) error {
+func extractMatchArms(db database, fset *token.FileSet, rel string, src []byte, f *ast.File) error {
 	stmt, err := db.Prepare(
 		"INSERT INTO match_arms (file, parent_fn, pattern, start_line, end_line, body_start, body_end, has_early_return) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
@@ -1726,7 +1439,7 @@ func exprName(expr ast.Expr) string {
 	return ""
 }
 
-func deleteFileRows(db *sql.DB, file string) error {
+func deleteFileRows(db database, file string) error {
 	for _, table := range []string{"lines", "lines_fts", "symbols", "calls", "imports", "defs", "files", "channels", "blocks", "match_arms", "refs"} {
 		col := "file"
 		if table == "calls" {
@@ -1739,11 +1452,11 @@ func deleteFileRows(db *sql.DB, file string) error {
 	return nil
 }
 
-func finalize(db *sql.DB) error {
+func finalize(db database) error {
 	return populateDirectories(db)
 }
 
-func populateDirectories(db *sql.DB) error {
+func populateDirectories(db database) error {
 	rows, err := db.Query("SELECT file, lines FROM files")
 	if err != nil {
 		return err
@@ -1773,6 +1486,12 @@ func populateDirectories(db *sql.DB) error {
 		}
 	}
 
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	stmt, err := db.Prepare("INSERT INTO directories (path, file_count, total_lines) VALUES (?, ?, ?)")
 	if err != nil {
 		return err

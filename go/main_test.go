@@ -122,7 +122,8 @@ func indexSample(t *testing.T, db *sql.DB, src, filename string) {
 	if err := os.WriteFile(path, []byte(src), 0644); err != nil {
 		t.Fatal(err)
 	}
-	fset, pkgFiles, info, err := loadPackages(dir)
+	source := sampleSource(t, path)
+	fset, pkgFiles, info, err := loadPackages(dir, map[string]sourceFile{path: source})
 	if err != nil {
 		t.Fatalf("loadPackages: %v", err)
 	}
@@ -140,9 +141,18 @@ func indexSample(t *testing.T, db *sql.DB, src, filename string) {
 			t.Fatalf("file %s not found in loaded packages (have %v)", filename, pkgFileKeys(pkgFiles))
 		}
 	}
-	if err := indexFile(db, fset, filename, path, f, info); err != nil {
+	if err := indexFile(db, fset, filename, source, f, info); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func sampleSource(t *testing.T, path string) sourceFile {
+	t.Helper()
+	source, err := readSource(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return source
 }
 
 func queryStrings(t *testing.T, db *sql.DB, query string) []string {
@@ -438,7 +448,10 @@ func TestCollectGoFilesSkipsVendor(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "pkg", "main.go"), []byte("package main\n"), 0644)
 	os.WriteFile(filepath.Join(dir, "vendor", "lib", "dep.go"), []byte("package lib\n"), 0644)
 
-	files := collectGoFiles(dir)
+	files, err := collectGoFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, f := range files {
 		if filepath.Base(f) == "dep.go" {
 			t.Error("should skip vendor/")
@@ -639,7 +652,7 @@ func TestEmptyFileIndexed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := indexFile(db, fset, "empty.go", emptyFile, f, nil); err != nil {
+	if err := indexFile(db, fset, "empty.go", sampleSource(t, emptyFile), f, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -697,7 +710,7 @@ func TestParseErrorIndexesLinesOnly(t *testing.T) {
 	}
 
 	// Index lines only
-	if err := indexFileLinesOnly(db, "bad.go", badFile); err != nil {
+	if err := indexFileLinesOnly(db, "bad.go", sampleSource(t, badFile)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -735,7 +748,7 @@ func TestParseErrorClearedOnFix(t *testing.T) {
 	// First: index broken file
 	badSrc := "package main\n\nfunc broken( {\n}\n"
 	os.WriteFile(badFile, []byte(badSrc), 0644)
-	indexFileLinesOnly(db, "fixme.go", badFile)
+	indexFileLinesOnly(db, "fixme.go", sampleSource(t, badFile))
 
 	pe := queryInt(t, db, "SELECT parse_error FROM files WHERE file = 'fixme.go'")
 	if pe != 1 {
@@ -753,7 +766,7 @@ func TestParseErrorClearedOnFix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexFile(db, fset, "fixme.go", badFile, f, nil)
+	indexFile(db, fset, "fixme.go", sampleSource(t, badFile), f, nil)
 
 	pe2 := queryInt(t, db, "SELECT parse_error FROM files WHERE file = 'fixme.go'")
 	if pe2 != 0 {
@@ -1100,7 +1113,11 @@ func TestSchemaVersionPragma(t *testing.T) {
 
 func TestSchemaIsCurrentDetectsCurrent(t *testing.T) {
 	db := setupDB(t)
-	if !schemaIsCurrent(db) {
+	current, err := schemaIsCurrent(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current {
 		t.Error("schemaIsCurrent should be true on fresh DB")
 	}
 }
@@ -1110,7 +1127,11 @@ func TestSchemaIsCurrentDetectsOutdated(t *testing.T) {
 	if _, err := db.Exec("PRAGMA user_version=0"); err != nil {
 		t.Fatal(err)
 	}
-	if schemaIsCurrent(db) {
+	current, err := schemaIsCurrent(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current {
 		t.Error("schemaIsCurrent should be false when user_version < SchemaVersion")
 	}
 }
@@ -1668,4 +1689,3 @@ func Multiplex(in, out chan int, done chan struct{}) {
 		t.Errorf("expected 2 match_arms rows from 2-arm select, got %d", got)
 	}
 }
-
